@@ -93,6 +93,22 @@ and everything else goes through the tunnel; use `--all-through-tunnel` to send 
 
 Other commands: `xray-channel-client status`, `test`, `set-link 'vless://...'`, `update`, `uninstall`.
 
+### Routing rules (change any time, no reinstall)
+
+```bash
+xray-channel-client rules                                   # show
+xray-channel-client rules all-tunnel                        # China sites through the tunnel too
+xray-channel-client rules china-direct                      # back to the default
+xray-channel-client rules tunnel add bilibili.com           # always via the tunnel
+xray-channel-client rules direct add mybank.com 10.0.0.0/8  # always direct
+xray-channel-client rules block  add doubleclick.net        # block
+xray-channel-client rules direct del mybank.com             # remove an entry
+xray-channel-client rules reset
+```
+
+Entries: a domain (matches its subdomains), an IP or CIDR, `geosite:<list>` or `geoip:<country>`.
+Priority: block > tunnel > direct > China rule > everything else (tunnel).
+
 ### Hardware
 
 No standard Raspberry Pi has two Ethernet ports (Pi 4 / Pi 5: one Gigabit port + Wi-Fi). For `router` mode use either:
