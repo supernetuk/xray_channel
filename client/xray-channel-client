@@ -129,7 +129,7 @@ render_config() {
   load_state; parse_link "$LINK"
   local tproxy=false; [ "$MODE" != proxy ] && tproxy=true
   local direct_cn=false; [ "$DIRECT_CN" = yes ] && direct_cn=true
-  local tmp; mkdir -p "$CONF_DIR"; tmp=$(mktemp "$CONF_DIR/.config.XXXXXX")
+  local tmp; mkdir -p "$CONF_DIR"; tmp=$(mktemp --suffix=.json "$CONF_DIR/.config.XXXXXX")
   jq -n \
     --arg host "$S_HOST" --argjson port "$S_PORT" --arg uuid "$S_UUID" --arg flow "$S_FLOW" \
     --arg sni "$S_SNI" --arg fp "$S_FP" --arg pbk "$S_PBK" --arg sid "$S_SID" \

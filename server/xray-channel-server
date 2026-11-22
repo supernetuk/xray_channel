@@ -162,7 +162,7 @@ render_config() {
   clients=$(awk -F'\t' 'NF>=2{printf "%s\t%s\n",$1,$2}' "$USERS" 2>/dev/null |
     jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {id: .[1], email: .[0], flow: "xtls-rprx-vision"})')
   mkdir -p "$CONF_DIR"
-  tmp=$(mktemp "$CONF_DIR/.config.XXXXXX")
+  tmp=$(mktemp --suffix=.json "$CONF_DIR/.config.XXXXXX")
   jq -n --argjson port "$PORT" --argjson clients "$clients" \
      --arg sni "$SNI" --arg pk "$PRIVATE_KEY" --arg sid "$SHORT_ID" '
   {
