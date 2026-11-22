@@ -169,7 +169,7 @@ render_config() {
        streamSettings: {network: "tcp", security: "reality",
                         realitySettings: {serverName: $sni, fingerprint: $fp, publicKey: $pbk,
                                           shortId: $sid, spiderX: "/"}}},
-      {tag: "direct", protocol: "freedom", settings: {domainStrategy: "UseIPv4"}},
+      {tag: "direct", protocol: "freedom", streamSettings: {sockopt: {domainStrategy: "UseIPv4"}}},
       {tag: "block", protocol: "blackhole"},
       {tag: "dns-out", protocol: "dns"}
     ],
