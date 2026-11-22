@@ -17,6 +17,23 @@ client box (Pi) ──TLS 1.3 to :443, SNI = camouflage site──▶ your serve
 
 ## 1. Server (VM in your data centre, Hong Kong, Singapore...)
 
+### All-in-one: `setup-vm.sh`
+
+One command sets up a fresh VM: the optional Linux ops MCP (so an AI assistant can check the VM read-only), a
+Cloudflare Tunnel for it (you paste the tunnel token at a hidden prompt), and the Xray server. Run it again later to
+update everything.
+
+```bash
+sudo -i
+curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/server/setup-vm.sh -o /root/setup-vm.sh \
+  && bash /root/setup-vm.sh --mcp-host ops-xray.example.com --sni www.example.ac.uk --user alice
+```
+
+Options: `--mcp-host <name>` (leave out for Xray only), `--sni <camouflage site>`, `--user <first user>`,
+`--host <public ip>`, `--tunnel-token-file <file>`, `--no-mcp`, `--no-xray`. The MCP part needs AlmaLinux/Rocky/RHEL.
+
+### Xray only
+
 Needs: a Linux VM (AlmaLinux/Rocky/RHEL 9-10, Debian 12, Ubuntu 22.04+) with a **public IPv4** and **TCP 443 free**.
 Use a dedicated VM: don't install it on a host that already serves websites on 443.
 
