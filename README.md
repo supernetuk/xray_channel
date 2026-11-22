@@ -23,7 +23,7 @@ Use a dedicated VM: don't install it on a host that already serves websites on 4
 ```bash
 sudo -i
 curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/server/xray-channel-server \
-  -o /usr/local/bin/xray-channel-server && chmod +x /usr/local/bin/xray-channel-server && xray-channel-server install
+  -o /usr/local/bin/xray-channel-server && chmod +x /usr/local/bin/xray-channel-server && /usr/local/bin/xray-channel-server install
 ```
 
 The installer downloads Xray (checksum verified), picks a camouflage site that offers TLS 1.3 + HTTP/2, generates the
@@ -33,6 +33,9 @@ client command** plus a `vless://` link (and a QR code) for phone/PC apps.
 Options: `--port 443` `--sni www.example.com` `--host <public-ip-or-name>` `--user <first-user-name>`
 
 ### Manage users
+
+If `xray-channel-server` isn't found, your root PATH lacks `/usr/local/bin`: use `/usr/local/bin/xray-channel-server ...`.
+
 
 | Command | What it does |
 |---|---|
@@ -56,7 +59,7 @@ Run the command the server printed, as root:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/client/xray-channel-client \
   -o /usr/local/bin/xray-channel-client && chmod +x /usr/local/bin/xray-channel-client \
-  && xray-channel-client install --link 'vless://...' --mode proxy
+  && /usr/local/bin/xray-channel-client install --link 'vless://...' --mode proxy
 ```
 
 ### Modes

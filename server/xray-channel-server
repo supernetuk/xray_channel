@@ -3,7 +3,7 @@
 #
 # Install (as root):
 #   curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/server/xray-channel-server \
-#     -o /usr/local/bin/xray-channel-server && chmod +x /usr/local/bin/xray-channel-server && xray-channel-server install
+#     -o /usr/local/bin/xray-channel-server && chmod +x /usr/local/bin/xray-channel-server && /usr/local/bin/xray-channel-server install
 #
 # Then:  xray-channel-server add <name>   |  client-cmd <name>  |  list  |  status  |  help
 set -euo pipefail
@@ -210,7 +210,7 @@ client_cmd() {
   local link; link=$(link_for "$1")
   cat <<EOF
 # Run on the client (Raspberry Pi / Linux), as root:
-curl -fsSL $REPO_RAW/client/xray-channel-client -o /usr/local/bin/xray-channel-client && chmod +x /usr/local/bin/xray-channel-client && xray-channel-client install --link '$link'
+curl -fsSL $REPO_RAW/client/xray-channel-client -o /usr/local/bin/xray-channel-client && chmod +x /usr/local/bin/xray-channel-client && /usr/local/bin/xray-channel-client install --link '$link'
 
 # Phone / PC apps (v2rayN, v2rayNG, Shadowrocket, Streisand, NekoBox...): import this link:
 $link

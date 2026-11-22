@@ -4,7 +4,7 @@
 # Install (as root), with the link your server printed:
 #   curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/client/xray-channel-client \
 #     -o /usr/local/bin/xray-channel-client && chmod +x /usr/local/bin/xray-channel-client \
-#     && xray-channel-client install --link 'vless://...'
+#     && /usr/local/bin/xray-channel-client install --link 'vless://...'
 #
 # Modes:
 #   proxy    (default) SOCKS5 :10808 + HTTP :10809 for devices on your LAN to use
