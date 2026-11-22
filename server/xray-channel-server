@@ -146,18 +146,14 @@ detect_host() {
 
 load_state() { [ -f "$STATE" ] || die "not installed: run 'xray-channel-server install'"; # shellcheck disable=SC1090
   . "$STATE"; }
-save_state() {
-  umask 077
-  cat > "$STATE" <<EOF
-HOST='$HOST'
-PORT='$PORT'
-SNI='$SNI'
-PRIVATE_KEY='$PRIVATE_KEY'
-PUBLIC_KEY='$PUBLIC_KEY'
-SHORT_ID='$SHORT_ID'
-FINGERPRINT='$FINGERPRINT'
-EOF
+save_state() {   # values are shell-escaped, so the file is safe to source
+  umask 077; mkdir -p "$ETC"; chmod 700 "$ETC"
+  local v
+  for v in HOST PORT SNI PRIVATE_KEY PUBLIC_KEY SHORT_ID FINGERPRINT; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE"
 }
+valid_host() { [[ "$1" =~ ^[A-Za-z0-9.-]{1,253}$ || "$1" =~ ^[0-9A-Fa-f:]{2,39}$ ]]; }
+valid_domain() { [[ "$1" =~ ^([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$ ]]; }
+valid_fp() { case "$1" in chrome|firefox|safari|edge|ios|android|random|randomized) return 0 ;; *) return 1 ;; esac; }
 
 # ---- config ----------------------------------------------------------------
 render_config() {
@@ -255,7 +251,10 @@ cmd_install() {
     --fingerprint) FINGERPRINT="$2"; shift 2 ;;
     *) die "unknown option $1" ;;
   esac; done
-  [[ "$PORT" =~ ^[0-9]+$ ]] || die "bad --port"
+  [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "bad --port"
+  [ -z "$SNI" ] || valid_domain "$SNI" || die "bad --sni (a domain name like www.example.com)"
+  [ -z "$HOST" ] || valid_host "$HOST" || die "bad --host (an IP or hostname)"
+  valid_fp "$FINGERPRINT" || die "bad --fingerprint (chrome, firefox, safari, edge, ios, android, random)"
   [ -f "$STATE" ] && die "already installed (state in $STATE). Use 'add', 'sni', or 'uninstall' first."
 
   if command -v ss >/dev/null && ss -Hltn "sport = :$PORT" | grep -q .; then
@@ -312,12 +311,12 @@ cmd_del() {
 }
 cmd_list() { load_state; printf '%-24s %-38s %s\n' NAME UUID CREATED; awk -F'\t' '{printf "%-24s %-38s %s\n",$1,$2,$3}' "$USERS"; }
 cmd_sni() {
-  need_root; load_state; local d="${1:-}"; [ -n "$d" ] || die "usage: sni <domain>"
+  need_root; load_state; local d="${1:-}"; valid_domain "$d" || die "usage: sni <domain>"
   sni_ok "$d" || die "$d does not offer TLS 1.3 + HTTP/2 from this server"
   SNI="$d"; save_state; apply
   c_ok "Camouflage site is now $d. Every client needs its new link (client-cmd <name>)."
 }
-cmd_set_host() { need_root; load_state; HOST="${1:-}"; [ -n "$HOST" ] || die "usage: set-host <ip-or-hostname>"; save_state; c_ok "Links now use $HOST"; }
+cmd_set_host() { need_root; load_state; HOST="${1:-}"; valid_host "$HOST" || die "usage: set-host <ip-or-hostname>"; save_state; c_ok "Links now use $HOST"; }
 cmd_rotate_keys() {
   need_root; load_state; gen_keys; SHORT_ID=$(openssl rand -hex 8); save_state; apply
   c_ok "New REALITY keys. Every client needs its new link (client-cmd <name>)."

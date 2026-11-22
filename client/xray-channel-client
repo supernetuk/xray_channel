@@ -108,21 +108,20 @@ parse_link() {   # sets S_UUID S_HOST S_PORT S_SNI S_FP S_PBK S_SID S_FLOW S_NAM
   [ -n "$S_HOST" ] || die "link: no server address"
   [ "$sec" = reality ] || die "link: security must be reality (got '$sec')"
   [ "$typ" = tcp ] || die "link: only type=tcp is supported (got '$typ')"
-  [ -n "$S_SNI" ] && [ -n "$S_PBK" ] || die "link: missing sni or pbk"
+  [[ "$S_SNI" =~ ^([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$ ]] || die "link: bad sni"
+  [[ "$S_PBK" =~ ^[A-Za-z0-9_-]{20,64}$ ]] || die "link: bad pbk"
+  [[ "$S_SID" =~ ^[0-9a-fA-F]{0,16}$ ]] || die "link: bad sid"
+  [[ "$S_HOST" =~ ^[A-Za-z0-9.:-]{1,253}$ ]] || die "link: bad server address"
+  [ "$S_FLOW" = xtls-rprx-vision ] || die "link: flow must be xtls-rprx-vision"
+  case "$S_FP" in chrome|firefox|safari|edge|ios|android|random|randomized) ;; *) die "link: bad fp" ;; esac
 }
 
 load_state() { [ -f "$STATE" ] || die "not installed: run 'xray-channel-client install --link ...'"; # shellcheck disable=SC1090
   . "$STATE"; }
-save_state() {
+save_state() {   # values are shell-escaped, so the file is safe to source as root
   mkdir -p "$ETC"; chmod 700 "$ETC"; umask 077
-  cat > "$STATE" <<EOF
-LINK='$LINK'
-MODE='$MODE'
-LAN_IF='$LAN_IF'
-WAN_IF='$WAN_IF'
-LAN_CIDR='$LAN_CIDR'
-DIRECT_CN='$DIRECT_CN'
-EOF
+  local v
+  for v in LINK MODE LAN_IF WAN_IF LAN_CIDR DIRECT_CN; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE"
 }
 
 # ---- Xray config ----------------------------------------------------------------
@@ -208,7 +207,7 @@ EOF
   cat > "$NET_UNIT" <<EOF
 [Unit]
 Description=xray-channel client network rules (nftables, policy routing)
-After=network-online.target
+After=network-online.target nftables.service
 Wants=network-online.target
 Before=xray-channel.service
 
@@ -240,6 +239,13 @@ cmd_net_up() {
   chain input {
     type filter hook input priority filter; policy accept;
     tcp dport { $SOCKS_PORT, $HTTP_PORT, $TPROXY_PORT } ip saddr != @private4 drop
+    udp dport { $SOCKS_PORT, $TPROXY_PORT } ip saddr != @private4 drop"
+  if [ "$MODE" = router ]; then   # proxy + DNS ports only on the LAN side, not the ISP router's network
+    rules+="
+    iifname \"$WAN_IF\" tcp dport { $SOCKS_PORT, $HTTP_PORT, $TPROXY_PORT, 53 } drop
+    iifname \"$WAN_IF\" udp dport { $SOCKS_PORT, $TPROXY_PORT, 53 } drop"
+  fi
+  rules+="
   }"
   if [ "$MODE" != proxy ]; then
     rules+="
@@ -286,7 +292,8 @@ setup_lan_router() {   # static LAN address via NetworkManager
   command -v nmcli >/dev/null || die "router mode needs NetworkManager (Raspberry Pi OS Bookworm has it). Set $LAN_IF to $LAN_CIDR yourself, then re-run with --skip-lan-setup"
   nmcli -t -f NAME con show | grep -qx xc-lan && nmcli con delete xc-lan >/dev/null
   nmcli con add type ethernet ifname "$LAN_IF" con-name xc-lan ipv4.method manual ipv4.addresses "$LAN_CIDR" \
-    ipv4.never-default yes ipv6.method disabled connection.autoconnect yes >/dev/null
+    ipv4.never-default yes ipv6.method disabled connection.autoconnect yes \
+    connection.autoconnect-priority 100 >/dev/null
   nmcli con up xc-lan >/dev/null || c_warn "$LAN_IF is not up yet (cable plugged in?). It will come up automatically."
 }
 
