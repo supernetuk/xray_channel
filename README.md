@@ -116,7 +116,17 @@ No standard Raspberry Pi has two Ethernet ports (Pi 4 / Pi 5: one Gigabit port +
 - **Raspberry Pi 5 or 4 + a USB 3 Gigabit Ethernet adapter** (RTL8153-based adapters work out of the box), or
 - a dual-port router board running Debian/Ubuntu, e.g. **NanoPi R5S / R6S** or **Orange Pi R5 Plus**.
 
-With one port, use `proxy` or `gateway` mode. Use a 64-bit OS (Raspberry Pi OS Bookworm 64-bit recommended).
+With one port, use `proxy` or `gateway` mode.
+
+**Wi-Fi as the LAN:** router mode can also make the Pi's built-in Wi-Fi the private network, with the RJ45 port as the
+uplink to the ISP router:
+
+```bash
+xray-channel-client install --link 'vless://...' --mode router --wan eth0 --lan wlan0 --wifi-ssid MyHome --wifi-band 5
+```
+
+It asks for the Wi-Fi password (hidden). `--wifi-country` sets the regulatory country (default `CN`). The Pi's own
+Wi-Fi suits a room or a small flat; for a larger home, add a USB Ethernet adapter and a proper access point. Use a 64-bit OS (Raspberry Pi OS Bookworm 64-bit recommended).
 
 ### If GitHub is slow or blocked where the client is
 

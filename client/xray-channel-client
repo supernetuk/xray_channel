@@ -298,13 +298,37 @@ EOF
   sysctl -q --system >/dev/null 2>&1 || true
 }
 
-setup_lan_router() {   # static LAN address via NetworkManager
+is_wifi() { [ -d "/sys/class/net/$1/wireless" ] || [ -L "/sys/class/net/$1/phy80211" ]; }
+
+setup_lan_router() {   # LAN side via NetworkManager: static address on a port, or a Wi-Fi hotspot
   command -v nmcli >/dev/null || die "router mode needs NetworkManager (Raspberry Pi OS Bookworm has it). Set $LAN_IF to $LAN_CIDR yourself, then re-run with --skip-lan-setup"
   nmcli -t -f NAME con show | grep -qx xc-lan && nmcli con delete xc-lan >/dev/null
-  nmcli con add type ethernet ifname "$LAN_IF" con-name xc-lan ipv4.method manual ipv4.addresses "$LAN_CIDR" \
-    ipv4.never-default yes ipv6.method disabled connection.autoconnect yes \
-    connection.autoconnect-priority 100 >/dev/null
-  nmcli con up xc-lan >/dev/null || c_warn "$LAN_IF is not up yet (cable plugged in?). It will come up automatically."
+  if is_wifi "$LAN_IF"; then
+    [ -n "$WIFI_SSID" ] || die "$LAN_IF is Wi-Fi: give the hotspot name with --wifi-ssid <name>"
+    if [ -z "$WIFI_PASS" ]; then
+      read -rsp "Wi-Fi password for '$WIFI_SSID' (8-63 characters, hidden): " WIFI_PASS </dev/tty; echo
+    fi
+    [ ${#WIFI_PASS} -ge 8 ] && [ ${#WIFI_PASS} -le 63 ] || die "Wi-Fi password must be 8-63 characters"
+    command -v rfkill >/dev/null && rfkill unblock wifi 2>/dev/null || true
+    command -v iw >/dev/null && iw reg set "$WIFI_COUNTRY" 2>/dev/null || true
+    if command -v raspi-config >/dev/null; then raspi-config nonint do_wifi_country "$WIFI_COUNTRY" >/dev/null 2>&1 || true; fi
+    nmcli radio wifi on
+    local band=bg channel=6
+    [ "$WIFI_BAND" = 5 ] && { band=a; channel=36; }
+    nmcli con add type wifi ifname "$LAN_IF" con-name xc-lan ssid "$WIFI_SSID" \
+      802-11-wireless.mode ap 802-11-wireless.band "$band" 802-11-wireless.channel "$channel" \
+      wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$WIFI_PASS" wifi-sec.proto rsn wifi-sec.pairwise ccmp wifi-sec.group ccmp \
+      ipv4.method manual ipv4.addresses "$LAN_CIDR" ipv4.never-default yes ipv6.method disabled \
+      connection.autoconnect yes connection.autoconnect-priority 100 >/dev/null
+    WIFI_PASS=""
+    nmcli con up xc-lan >/dev/null || die "the Wi-Fi hotspot did not start (try --wifi-band 2.4, or check 'nmcli dev')"
+    c_ok "Wi-Fi hotspot '$WIFI_SSID' is on ($([ "$WIFI_BAND" = 5 ] && echo 5 GHz || echo 2.4 GHz), country $WIFI_COUNTRY)"
+  else
+    nmcli con add type ethernet ifname "$LAN_IF" con-name xc-lan ipv4.method manual ipv4.addresses "$LAN_CIDR" \
+      ipv4.never-default yes ipv6.method disabled connection.autoconnect yes \
+      connection.autoconnect-priority 100 >/dev/null
+    nmcli con up xc-lan >/dev/null || c_warn "$LAN_IF is not up yet (cable plugged in?). It will come up automatically."
+  fi
 }
 
 setup_dnsmasq() {
@@ -340,12 +364,17 @@ cmd_install() {
   need_root
   LINK=""; MODE=proxy; LAN_IF=""; WAN_IF=""; LAN_CIDR="192.168.88.1/24"; DIRECT_CN=yes
   local offline="" skip_lan=no
+  WIFI_SSID=""; WIFI_PASS=""; WIFI_COUNTRY="CN"; WIFI_BAND="2.4"
   while [ $# -gt 0 ]; do case "$1" in
     --link) LINK="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --lan) LAN_IF="$2"; shift 2 ;;
     --wan) WAN_IF="$2"; shift 2 ;;
     --lan-ip) LAN_CIDR="$2"; shift 2 ;;
+    --wifi-ssid) WIFI_SSID="$2"; shift 2 ;;
+    --wifi-pass-file) WIFI_PASS="$(head -n1 "$2")"; shift 2 ;;
+    --wifi-country) WIFI_COUNTRY="$(tr 'a-z' 'A-Z' <<<"$2")"; shift 2 ;;
+    --wifi-band) WIFI_BAND="$2"; shift 2 ;;
     --all-through-tunnel) DIRECT_CN=no; shift ;;
     --offline) offline="$(cd "$2" && pwd)"; shift 2 ;;
     --skip-lan-setup) skip_lan=yes; shift ;;
@@ -361,6 +390,9 @@ cmd_install() {
     [ -n "$LAN_IF" ] || die "router mode needs --lan <second network port>, e.g. --lan eth1 (see 'ip link')"
     [ "$LAN_IF" != "$WAN_IF" ] || die "--lan and --wan must be different ports"
     ip link show "$LAN_IF" >/dev/null 2>&1 || die "no network port called $LAN_IF"
+    [[ "$WIFI_COUNTRY" =~ ^[A-Z]{2}$ ]] || die "--wifi-country must be a 2-letter code (CN, GB...)"
+    case "$WIFI_BAND" in 2.4|5) ;; *) die "--wifi-band must be 2.4 or 5" ;; esac
+    if [ -n "$WIFI_SSID" ]; then [[ "$WIFI_SSID" =~ ^[^[:cntrl:]]{1,32}$ ]] || die "--wifi-ssid must be 1-32 characters"; fi
   fi
   [ "$MODE" = proxy ] || [ -n "$LAN_IF" ] || die "could not find the network port: pass --lan"
 
@@ -511,6 +543,8 @@ xray-channel-client $VERSION
       --mode gateway    one port: devices use the Pi as gateway + DNS
       --mode router     two ports: --lan <port> to devices, --wan <port> to the ISP router
       --lan-ip CIDR     router mode LAN address (default 192.168.88.1/24)
+      --lan wlan0 --wifi-ssid NAME   router mode with the Pi's Wi-Fi as the LAN (hotspot); asks for the password
+      --wifi-country CN --wifi-band 2.4|5   hotspot country code (default CN) and band (default 2.4)
       --all-through-tunnel   send China sites through the tunnel too (default: direct)
       --offline DIR     install Xray from a bundle made by 'xray-channel-server bundle'
   status | test | set-link 'vless://...' | update | uninstall
