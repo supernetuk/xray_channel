@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+# xray-channel-server: one-command Xray VLESS + REALITY + Vision server.
+#
+# Install (as root):
+#   curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/server/xray-channel-server \
+#     -o /usr/local/bin/xray-channel-server && chmod +x /usr/local/bin/xray-channel-server && xray-channel-server install
+#
+# Then:  xray-channel-server add <name>   |  client-cmd <name>  |  list  |  status  |  help
+set -euo pipefail
+
+VERSION="1.0.0"
+REPO_RAW="${XC_REPO_RAW:-https://raw.githubusercontent.com/supernetuk/xray_channel/main}"
+XRAY_RELEASES="${XC_XRAY_RELEASES:-https://github.com/XTLS/Xray-core/releases/latest/download}"
+
+ETC=/etc/xray-channel
+STATE="$ETC/server.env"
+USERS="$ETC/users.tsv"            # name <TAB> uuid <TAB> created
+CONF_DIR=/usr/local/etc/xray-channel
+CONF="$CONF_DIR/config.json"
+BIN=/usr/local/bin/xray
+ASSETS=/usr/local/share/xray
+CACHE=/var/lib/xray-channel
+UNIT=/etc/systemd/system/xray-channel.service
+SNI_CANDIDATES="www.microsoft.com www.apple.com www.amazon.com www.samsung.com www.nvidia.com"
+
+c_ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
+c_warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die()    { printf '\033[31mError: %s\033[0m\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo -i first)"; }
+
+pkg_install() {
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+  elif command -v dnf >/dev/null; then dnf install -y -q "$@" >/dev/null
+  elif command -v yum >/dev/null; then yum install -y -q "$@" >/dev/null
+  else die "no apt/dnf/yum: install $* yourself"; fi
+}
+ensure_tools() {
+  local miss=()
+  for t in curl unzip jq openssl; do command -v "$t" >/dev/null || miss+=("$t"); done
+  command -v sha256sum >/dev/null || miss+=(coreutils)
+  [ ${#miss[@]} -eq 0 ] || pkg_install "${miss[@]}"
+}
+
+xray_zip_name() {   # $1 = uname -m
+  case "$1" in
+    x86_64|amd64) echo "Xray-linux-64.zip" ;;
+    aarch64|arm64) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7l|armv7*) echo "Xray-linux-arm32-v7a.zip" ;;
+    armv6l) echo "Xray-linux-arm32-v6.zip" ;;
+    *) die "unsupported CPU: $1" ;;
+  esac
+}
+
+# download a release zip + its .dgst into $2, verify SHA-256
+fetch_xray_zip() {
+  local zip="$1" dir="$2" want got
+  mkdir -p "$dir"
+  curl -fsSL --retry 3 -o "$dir/$zip.tmp" "$XRAY_RELEASES/$zip" || die "download of $zip failed"
+  curl -fsSL --retry 3 -o "$dir/$zip.dgst" "$XRAY_RELEASES/$zip.dgst" || die "download of $zip.dgst failed"
+  want=$(grep -iE '^SHA2?-?256' "$dir/$zip.dgst" | head -1 | sed -E 's/.*= *//' | tr -d '[:space:]' | tr 'A-F' 'a-f')
+  got=$(sha256sum "$dir/$zip.tmp" | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$want" = "$got" ] || { rm -f "$dir/$zip.tmp"; die "checksum mismatch for $zip"; }
+  mv "$dir/$zip.tmp" "$dir/$zip"
+}
+
+install_xray_from_zip() {
+  local zipfile="$1" tmp
+  tmp=$(mktemp -d)
+  unzip -q -o "$zipfile" -d "$tmp"
+  install -m 755 "$tmp/xray" "$BIN"
+  mkdir -p "$ASSETS"
+  for f in geoip.dat geosite.dat; do [ -f "$tmp/$f" ] && install -m 644 "$tmp/$f" "$ASSETS/$f"; done
+  rm -rf "$tmp"
+}
+
+install_xray() {
+  local zip; zip=$(xray_zip_name "$(uname -m)")
+  fetch_xray_zip "$zip" "$CACHE"
+  install_xray_from_zip "$CACHE/$zip"
+  c_ok "Xray installed: $("$BIN" version | head -1)"
+}
+
+nobody_group() { id -gn nobody 2>/dev/null || echo nogroup; }
+
+write_unit() {
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=xray-channel server (VLESS + REALITY + Vision)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nobody
+Environment=XRAY_LOCATION_ASSET=$ASSETS
+ExecStart=$BIN run -config $CONF
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# ---- keys ------------------------------------------------------------------
+gen_keys() {   # sets PRIVATE_KEY PUBLIC_KEY
+  local out
+  out=$("$BIN" x25519)
+  PRIVATE_KEY=$(printf '%s\n' "$out" | grep -iE '^ *private ?key' | head -1 | sed -E 's/^[^:]*: *//' | tr -d '[:space:]')
+  # newer Xray prints the public key as "Password", older as "Public key"
+  PUBLIC_KEY=$(printf '%s\n' "$out" | grep -iE '^ *(public ?key|password)' | head -1 | sed -E 's/^[^:]*: *//' | tr -d '[:space:]')
+  [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] || die "could not read keys from 'xray x25519' output:
+$out"
+}
+new_uuid() { "$BIN" uuid; }
+
+# ---- camouflage site --------------------------------------------------------
+sni_ok() {   # TLS 1.3 + HTTP/2 reachable from this server
+  local d="$1" out
+  out=$(timeout 10 openssl s_client -connect "$d:443" -servername "$d" -tls1_3 -alpn h2 </dev/null 2>/dev/null) || true
+  grep -q 'ALPN protocol: h2' <<<"$out" && grep -q 'TLSv1.3' <<<"$out"
+}
+pick_sni() {
+  local d
+  for d in $SNI_CANDIDATES; do
+    if sni_ok "$d"; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
+detect_host() {
+  local ip=""
+  ip=$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
+  [ -n "$ip" ] || ip=$(curl -4 -fsS --max-time 6 https://ifconfig.me 2>/dev/null || true)
+  [ -n "$ip" ] || ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -nE 's/.* src ([0-9.]+).*/\1/p')
+  echo "$ip"
+}
+
+load_state() { [ -f "$STATE" ] || die "not installed: run 'xray-channel-server install'"; # shellcheck disable=SC1090
+  . "$STATE"; }
+save_state() {
+  umask 077
+  cat > "$STATE" <<EOF
+HOST='$HOST'
+PORT='$PORT'
+SNI='$SNI'
+PRIVATE_KEY='$PRIVATE_KEY'
+PUBLIC_KEY='$PUBLIC_KEY'
+SHORT_ID='$SHORT_ID'
+FINGERPRINT='$FINGERPRINT'
+EOF
+}
+
+# ---- config ----------------------------------------------------------------
+render_config() {
+  load_state
+  local clients tmp
+  clients=$(awk -F'\t' 'NF>=2{printf "%s\t%s\n",$1,$2}' "$USERS" 2>/dev/null |
+    jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {id: .[1], email: .[0], flow: "xtls-rprx-vision"})')
+  mkdir -p "$CONF_DIR"
+  tmp=$(mktemp "$CONF_DIR/.config.XXXXXX")
+  jq -n --argjson port "$PORT" --argjson clients "$clients" \
+     --arg sni "$SNI" --arg pk "$PRIVATE_KEY" --arg sid "$SHORT_ID" '
+  {
+    log: {loglevel: "warning"},
+    inbounds: [{
+      tag: "vless-in", port: $port, protocol: "vless",
+      settings: {clients: $clients, decryption: "none"},
+      streamSettings: {
+        network: "tcp", security: "reality",
+        realitySettings: {show: false, dest: ($sni + ":443"), xver: 0,
+                          serverNames: [$sni], privateKey: $pk, shortIds: [$sid]}
+      },
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+    }],
+    outbounds: [
+      {tag: "direct", protocol: "freedom", settings: {domainStrategy: "UseIPv4"}},
+      {tag: "block", protocol: "blackhole"}
+    ],
+    routing: {domainStrategy: "IPIfNonMatch", rules: [
+      {ip: ["geoip:private"], outboundTag: "block"},
+      {protocol: ["bittorrent"], outboundTag: "block"}
+    ]}
+  }' > "$tmp"
+  chown root:"$(nobody_group)" "$tmp"; chmod 640 "$tmp"
+  if XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$CONF"
+  else
+    XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >&2 || true
+    rm -f "$tmp"; die "generated config failed 'xray -test' (shown above); old config kept"
+  fi
+}
+apply() { render_config; systemctl restart xray-channel; sleep 1; systemctl is-active -q xray-channel || { journalctl -u xray-channel -n 30 --no-pager; die "service failed to start"; }; }
+
+# ---- links -----------------------------------------------------------------
+user_uuid() { awk -F'\t' -v n="$1" '$1==n{print $2}' "$USERS" 2>/dev/null; }
+link_for() {
+  load_state
+  local name="$1" uuid host
+  uuid=$(user_uuid "$name"); [ -n "$uuid" ] || die "no such user: $name"
+  host="$HOST"; [[ "$host" == *:* ]] && host="[$host]"
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
+    "$uuid" "$host" "$PORT" "$SNI" "$FINGERPRINT" "$PUBLIC_KEY" "$SHORT_ID" "$name"
+}
+client_cmd() {
+  local link; link=$(link_for "$1")
+  cat <<EOF
+# Run on the client (Raspberry Pi / Linux), as root:
+curl -fsSL $REPO_RAW/client/xray-channel-client -o /usr/local/bin/xray-channel-client && chmod +x /usr/local/bin/xray-channel-client && xray-channel-client install --link '$link'
+
+# Phone / PC apps (v2rayN, v2rayNG, Shadowrocket, Streisand, NekoBox...): import this link:
+$link
+EOF
+  if command -v qrencode >/dev/null; then echo; qrencode -t ANSIUTF8 "$link"; fi
+}
+
+open_firewall() {
+  if systemctl is-active -q firewalld 2>/dev/null; then
+    firewall-cmd -q --permanent --add-port="$PORT/tcp" && firewall-cmd -q --reload && c_ok "firewalld: opened $PORT/tcp"
+  elif command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw allow "$PORT/tcp" >/dev/null && c_ok "ufw: opened $PORT/tcp"
+  else
+    c_warn "No firewalld/ufw active: make sure TCP $PORT is open to the internet (cloud security group / DC firewall)."
+  fi
+}
+
+enable_bbr() {
+  if modprobe tcp_bbr 2>/dev/null || grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+    cat > /etc/sysctl.d/90-xray-channel.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    sysctl -q --system >/dev/null 2>&1 || true
+  fi
+}
+
+# ---- commands --------------------------------------------------------------
+cmd_install() {
+  need_root
+  PORT=443; SNI=""; HOST=""; local first="user1"
+  FINGERPRINT=chrome
+  while [ $# -gt 0 ]; do case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --sni) SNI="$2"; shift 2 ;;
+    --host) HOST="$2"; shift 2 ;;
+    --user) first="$2"; shift 2 ;;
+    --fingerprint) FINGERPRINT="$2"; shift 2 ;;
+    *) die "unknown option $1" ;;
+  esac; done
+  [[ "$PORT" =~ ^[0-9]+$ ]] || die "bad --port"
+  [ -f "$STATE" ] && die "already installed (state in $STATE). Use 'add', 'sni', or 'uninstall' first."
+
+  if command -v ss >/dev/null && ss -Hltn "sport = :$PORT" | grep -q .; then
+    die "port $PORT is already in use on this machine: install on a separate VM, or use --port"
+  fi
+
+  ensure_tools
+  command -v qrencode >/dev/null || pkg_install qrencode 2>/dev/null || true
+  install_xray
+  write_unit
+
+  if [ -z "$SNI" ]; then
+    echo "Choosing a camouflage site (TLS 1.3 + HTTP/2, reachable from here)..."
+    SNI=$(pick_sni) || die "none of: $SNI_CANDIDATES passed. Pass --sni <domain> (a big site reachable from China, TLS 1.3 + h2)."
+  else
+    sni_ok "$SNI" || die "$SNI does not offer TLS 1.3 + HTTP/2 from this server"
+  fi
+  [ -n "$HOST" ] || HOST=$(detect_host)
+  [ -n "$HOST" ] || die "could not detect this server's public IP: pass --host <ip-or-hostname>"
+
+  gen_keys
+  SHORT_ID=$(openssl rand -hex 8)
+  mkdir -p "$ETC"; chmod 700 "$ETC"
+  save_state
+  : > "$USERS"; chmod 600 "$USERS"
+  printf '%s\t%s\t%s\n' "$first" "$(new_uuid)" "$(date -u +%F)" >> "$USERS"
+
+  render_config
+  systemctl enable -q --now xray-channel
+  systemctl restart xray-channel; sleep 1
+  systemctl is-active -q xray-channel || { journalctl -u xray-channel -n 30 --no-pager; die "service failed to start"; }
+  open_firewall
+  enable_bbr
+
+  echo; c_ok "Server ready: $HOST:$PORT  (camouflage: $SNI)"
+  [[ "$HOST" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]] && \
+    c_warn "HOST $HOST is a private address. If this VM is behind NAT, forward TCP $PORT to it and re-run with: xray-channel-server set-host <public-ip>"
+  echo; client_cmd "$first"
+}
+
+cmd_add() {
+  need_root; load_state
+  local name="${1:-}"; [[ "$name" =~ ^[A-Za-z0-9._-]{1,40}$ ]] || die "usage: add <name> (letters, digits, . _ -)"
+  [ -z "$(user_uuid "$name")" ] || die "user $name already exists"
+  printf '%s\t%s\t%s\n' "$name" "$(new_uuid)" "$(date -u +%F)" >> "$USERS"
+  apply; c_ok "Added $name"; echo; client_cmd "$name"
+}
+cmd_del() {
+  need_root; load_state
+  local name="${1:-}"; [ -n "$(user_uuid "$name")" ] || die "no such user: $name"
+  [ "$(grep -c . "$USERS")" -gt 1 ] || die "can't delete the last user (add another first)"
+  awk -F'\t' -v n="$name" '$1!=n' "$USERS" > "$USERS.tmp" && mv "$USERS.tmp" "$USERS"; chmod 600 "$USERS"
+  apply; c_ok "Deleted $name: their link stops working now"
+}
+cmd_list() { load_state; printf '%-24s %-38s %s\n' NAME UUID CREATED; awk -F'\t' '{printf "%-24s %-38s %s\n",$1,$2,$3}' "$USERS"; }
+cmd_sni() {
+  need_root; load_state; local d="${1:-}"; [ -n "$d" ] || die "usage: sni <domain>"
+  sni_ok "$d" || die "$d does not offer TLS 1.3 + HTTP/2 from this server"
+  SNI="$d"; save_state; apply
+  c_ok "Camouflage site is now $d. Every client needs its new link (client-cmd <name>)."
+}
+cmd_set_host() { need_root; load_state; HOST="${1:-}"; [ -n "$HOST" ] || die "usage: set-host <ip-or-hostname>"; save_state; c_ok "Links now use $HOST"; }
+cmd_rotate_keys() {
+  need_root; load_state; gen_keys; SHORT_ID=$(openssl rand -hex 8); save_state; apply
+  c_ok "New REALITY keys. Every client needs its new link (client-cmd <name>)."
+}
+cmd_status() {
+  load_state
+  echo "xray-channel-server $VERSION  |  $("$BIN" version 2>/dev/null | head -1)"
+  echo "Endpoint: $HOST:$PORT   camouflage: $SNI   users: $(grep -c . "$USERS")"
+  systemctl --no-pager --lines=5 status xray-channel || true
+}
+cmd_update() {
+  need_root; load_state; ensure_tools; install_xray; apply; c_ok "Updated."
+}
+cmd_bundle() {   # offline package for clients that can't reach GitHub
+  need_root; load_state
+  local name="${1:-}"; [ -n "$(user_uuid "$name")" ] || die "usage: bundle <name>"
+  local dir out z
+  dir=$(mktemp -d)/xray-channel-$name; mkdir -p "$dir"
+  curl -fsSL --retry 3 -o "$dir/xray-channel-client" "$REPO_RAW/client/xray-channel-client" || die "could not download client script"
+  chmod +x "$dir/xray-channel-client"
+  for z in Xray-linux-arm64-v8a.zip Xray-linux-arm32-v7a.zip Xray-linux-64.zip; do
+    fetch_xray_zip "$z" "$dir"
+  done
+  link_for "$name" > "$dir/link.txt"
+  cat > "$dir/install.sh" <<'EOF'
+#!/usr/bin/env bash
+# Offline install: copy this folder to the Pi, then:  sudo bash install.sh [--mode proxy|gateway|router ...]
+cd "$(dirname "$0")"
+exec bash ./xray-channel-client install --offline . --link "$(cat link.txt)" "$@"
+EOF
+  chmod +x "$dir/install.sh"
+  out="/root/xray-channel-$name.tar.gz"
+  tar -C "$(dirname "$dir")" -czf "$out" "xray-channel-$name"
+  rm -rf "$(dirname "$dir")"
+  c_ok "Bundle: $out"
+  echo "Copy it to the Pi (USB, scp...), then:  tar xzf xray-channel-$name.tar.gz && sudo bash xray-channel-$name/install.sh"
+}
+cmd_uninstall() {
+  need_root
+  read -r -p "Remove xray-channel server, its keys and all users? Type YES: " a; [ "$a" = YES ] || { echo Cancelled; exit 1; }
+  systemctl disable -q --now xray-channel 2>/dev/null || true
+  rm -f "$UNIT" /etc/sysctl.d/90-xray-channel.conf; systemctl daemon-reload
+  rm -rf "$ETC" "$CONF_DIR" "$CACHE"
+  c_ok "Removed. (Xray binary left in $BIN; delete it if unused.)"
+}
+
+usage() {
+  cat <<EOF
+xray-channel-server $VERSION: Xray VLESS + REALITY + Vision server
+
+  install [--port 443] [--sni domain] [--host ip] [--user name]   first-time setup
+  add <name>          add a user and print their one-line client command
+  del <name>          remove a user (their link stops working)
+  list                list users
+  client-cmd <name>   print the client install command + app link (+ QR)
+  link <name>         print only the vless:// link
+  bundle <name>       make an offline package (for clients that can't reach GitHub)
+  sni <domain>        change the camouflage site (all clients need new links)
+  set-host <ip|name>  change the address put into links
+  rotate-keys         new REALITY keys (all clients need new links)
+  status | update | uninstall
+EOF
+}
+
+case "${1:-help}" in
+  install) shift; cmd_install "$@" ;;
+  add) cmd_add "${2:-}" ;;
+  del|delete|remove) cmd_del "${2:-}" ;;
+  list) cmd_list ;;
+  client-cmd) load_state; client_cmd "${2:-}" ;;
+  link) link_for "${2:-}" ;;
+  bundle) cmd_bundle "${2:-}" ;;
+  sni) cmd_sni "${2:-}" ;;
+  set-host) cmd_set_host "${2:-}" ;;
+  rotate-keys) cmd_rotate_keys ;;
+  status) cmd_status ;;
+  update) cmd_update ;;
+  uninstall) cmd_uninstall ;;
+  version) echo "$VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

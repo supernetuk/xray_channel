@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# xray-channel-client: one-command Xray VLESS + REALITY + Vision client for Raspberry Pi / Linux.
+#
+# Install (as root), with the link your server printed:
+#   curl -fsSL https://raw.githubusercontent.com/supernetuk/xray_channel/main/client/xray-channel-client \
+#     -o /usr/local/bin/xray-channel-client && chmod +x /usr/local/bin/xray-channel-client \
+#     && xray-channel-client install --link 'vless://...'
+#
+# Modes:
+#   proxy    (default) SOCKS5 :10808 + HTTP :10809 for devices on your LAN to use
+#   gateway  one network port: devices set the Pi as their gateway + DNS ("side router")
+#   router   two network ports: WAN to the ISP router, LAN to your devices; the Pi runs DHCP + DNS
+set -euo pipefail
+
+VERSION="1.0.0"
+XRAY_RELEASES="${XC_XRAY_RELEASES:-https://github.com/XTLS/Xray-core/releases/latest/download}"
+
+ETC=/etc/xray-channel-client
+STATE="$ETC/client.env"
+CONF_DIR=/usr/local/etc/xray-channel
+CONF="$CONF_DIR/config.json"
+BIN=/usr/local/bin/xray
+ASSETS=/usr/local/share/xray
+CACHE=/var/lib/xray-channel
+UNIT=/etc/systemd/system/xray-channel.service
+NET_UNIT=/etc/systemd/system/xray-channel-net.service
+DNSMASQ_CONF=/etc/dnsmasq.d/xray-channel.conf
+SELF=/usr/local/bin/xray-channel-client
+
+SOCKS_PORT=10808
+HTTP_PORT=10809
+TPROXY_PORT=12345
+DNS_PORT=5353
+MARK=1
+TABLE=100
+
+c_ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
+c_warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die()    { printf '\033[31mError: %s\033[0m\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo -i first)"; }
+
+pkg_install() {
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+  elif command -v dnf >/dev/null; then dnf install -y -q "$@" >/dev/null
+  else die "no apt/dnf: install $* yourself"; fi
+}
+
+xray_zip_name() {
+  case "$1" in
+    x86_64|amd64) echo "Xray-linux-64.zip" ;;
+    aarch64|arm64) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7l|armv7*) echo "Xray-linux-arm32-v7a.zip" ;;
+    armv6l) echo "Xray-linux-arm32-v6.zip" ;;
+    *) die "unsupported CPU: $1" ;;
+  esac
+}
+verify_zip() {   # $1 zip, $2 dgst
+  local want got
+  want=$(grep -iE '^SHA2?-?256' "$2" | head -1 | sed -E 's/.*= *//' | tr -d '[:space:]' | tr 'A-F' 'a-f')
+  got=$(sha256sum "$1" | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$want" = "$got" ]
+}
+install_xray() {   # $1 = offline dir or ""
+  local zip src tmp
+  zip=$(xray_zip_name "$(uname -m)")
+  if [ -n "${1:-}" ]; then
+    src="$1/$zip"; [ -f "$src" ] || die "$zip not found in $1"
+    if [ -f "$src.dgst" ]; then verify_zip "$src" "$src.dgst" || die "checksum mismatch for $src"; fi
+  else
+    mkdir -p "$CACHE"; src="$CACHE/$zip"
+    curl -fsSL --retry 3 --connect-timeout 15 -o "$src.tmp" "$XRAY_RELEASES/$zip" \
+      || die "could not download Xray from GitHub. If GitHub is blocked here, make an offline bundle on the server: xray-channel-server bundle <name>"
+    curl -fsSL --retry 3 -o "$src.dgst" "$XRAY_RELEASES/$zip.dgst" || die "could not download $zip.dgst"
+    verify_zip "$src.tmp" "$src.dgst" || { rm -f "$src.tmp"; die "checksum mismatch for $zip"; }
+    mv "$src.tmp" "$src"
+  fi
+  tmp=$(mktemp -d); unzip -q -o "$src" -d "$tmp"
+  install -m 755 "$tmp/xray" "$BIN"; mkdir -p "$ASSETS"
+  for f in geoip.dat geosite.dat; do [ -f "$tmp/$f" ] && install -m 644 "$tmp/$f" "$ASSETS/$f"; done
+  rm -rf "$tmp"
+  c_ok "Xray installed: $("$BIN" version | head -1)"
+}
+nobody_group() { id -gn nobody 2>/dev/null || echo nogroup; }
+
+# ---- link parsing -------------------------------------------------------------
+urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
+parse_link() {   # sets S_UUID S_HOST S_PORT S_SNI S_FP S_PBK S_SID S_FLOW S_NAME
+  local link="$1" rest q hostport kv k v
+  [[ "$link" == vless://* ]] || die "link must start with vless://"
+  rest="${link#vless://}"
+  S_NAME=""; [[ "$rest" == *#* ]] && { S_NAME=$(urldecode "${rest#*#}"); rest="${rest%%#*}"; }
+  q=""; [[ "$rest" == *\?* ]] && { q="${rest#*\?}"; rest="${rest%%\?*}"; }
+  S_UUID="${rest%%@*}"; hostport="${rest#*@}"
+  if [[ "$hostport" == \[* ]]; then S_HOST="${hostport#[}"; S_HOST="${S_HOST%%]*}"; S_PORT="${hostport##*]:}"
+  else S_HOST="${hostport%:*}"; S_PORT="${hostport##*:}"; fi
+  S_SNI=""; S_FP="chrome"; S_PBK=""; S_SID=""; S_FLOW="xtls-rprx-vision"; local sec="" typ="tcp"
+  IFS='&' read -r -a kvs <<<"$q"
+  for kv in "${kvs[@]}"; do
+    k="${kv%%=*}"; v=$(urldecode "${kv#*=}")
+    case "$k" in
+      sni) S_SNI="$v" ;; fp) S_FP="$v" ;; pbk) S_PBK="$v" ;; sid) S_SID="$v" ;;
+      flow) S_FLOW="$v" ;; security) sec="$v" ;; type) typ="$v" ;;
+    esac
+  done
+  [[ "$S_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || die "link: bad UUID"
+  [[ "$S_PORT" =~ ^[0-9]+$ ]] || die "link: bad port"
+  [ -n "$S_HOST" ] || die "link: no server address"
+  [ "$sec" = reality ] || die "link: security must be reality (got '$sec')"
+  [ "$typ" = tcp ] || die "link: only type=tcp is supported (got '$typ')"
+  [ -n "$S_SNI" ] && [ -n "$S_PBK" ] || die "link: missing sni or pbk"
+}
+
+load_state() { [ -f "$STATE" ] || die "not installed: run 'xray-channel-client install --link ...'"; # shellcheck disable=SC1090
+  . "$STATE"; }
+save_state() {
+  mkdir -p "$ETC"; chmod 700 "$ETC"; umask 077
+  cat > "$STATE" <<EOF
+LINK='$LINK'
+MODE='$MODE'
+LAN_IF='$LAN_IF'
+WAN_IF='$WAN_IF'
+LAN_CIDR='$LAN_CIDR'
+DIRECT_CN='$DIRECT_CN'
+EOF
+}
+
+# ---- Xray config ----------------------------------------------------------------
+render_config() {
+  load_state; parse_link "$LINK"
+  local tproxy=false; [ "$MODE" != proxy ] && tproxy=true
+  local direct_cn=false; [ "$DIRECT_CN" = yes ] && direct_cn=true
+  local tmp; mkdir -p "$CONF_DIR"; tmp=$(mktemp "$CONF_DIR/.config.XXXXXX")
+  jq -n \
+    --arg host "$S_HOST" --argjson port "$S_PORT" --arg uuid "$S_UUID" --arg flow "$S_FLOW" \
+    --arg sni "$S_SNI" --arg fp "$S_FP" --arg pbk "$S_PBK" --arg sid "$S_SID" \
+    --argjson socks "$SOCKS_PORT" --argjson http "$HTTP_PORT" --argjson tp "$TPROXY_PORT" --argjson dnsp "$DNS_PORT" \
+    --argjson tproxy "$tproxy" --argjson cn "$direct_cn" '
+  def sniff: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true};
+  {
+    log: {loglevel: "warning"},
+    dns: {
+      queryStrategy: "UseIPv4",
+      servers: ((if $cn then [{address: "223.5.5.5", domains: ["geosite:cn"], expectIPs: ["geoip:cn"]}] else [] end)
+                + ["1.1.1.1", "8.8.8.8"])
+    },
+    inbounds: ([
+      {tag: "socks-in", listen: "0.0.0.0", port: $socks, protocol: "socks",
+       settings: {udp: true}, sniffing: sniff},
+      {tag: "http-in", listen: "0.0.0.0", port: $http, protocol: "http", sniffing: sniff},
+      {tag: "dns-in", listen: "127.0.0.1", port: $dnsp, protocol: "dokodemo-door",
+       settings: {address: "1.1.1.1", port: 53, network: "tcp,udp"}}
+    ] + (if $tproxy then [
+      {tag: "tproxy-in", listen: "0.0.0.0", port: $tp, protocol: "dokodemo-door",
+       settings: {network: "tcp,udp", followRedirect: true},
+       streamSettings: {sockopt: {tproxy: "tproxy"}}, sniffing: sniff}
+    ] else [] end)),
+    outbounds: [
+      {tag: "proxy", protocol: "vless",
+       settings: {vnext: [{address: $host, port: $port,
+                           users: [{id: $uuid, encryption: "none", flow: $flow}]}]},
+       streamSettings: {network: "tcp", security: "reality",
+                        realitySettings: {serverName: $sni, fingerprint: $fp, publicKey: $pbk,
+                                          shortId: $sid, spiderX: "/"}}},
+      {tag: "direct", protocol: "freedom", settings: {domainStrategy: "UseIPv4"}},
+      {tag: "block", protocol: "blackhole"},
+      {tag: "dns-out", protocol: "dns"}
+    ],
+    routing: {domainStrategy: "IPIfNonMatch", rules: ([
+      {inboundTag: ["dns-in"], outboundTag: "dns-out"},
+      {inboundTag: ["tproxy-in"], network: "udp", port: "53", outboundTag: "dns-out"},
+      {ip: ["223.5.5.5"], outboundTag: "direct"},
+      {ip: ["1.1.1.1", "8.8.8.8"], outboundTag: "proxy"},
+      {ip: ["geoip:private"], outboundTag: "direct"}
+    ] + (if $cn then [
+      {domain: ["geosite:cn"], outboundTag: "direct"},
+      {ip: ["geoip:cn"], outboundTag: "direct"}
+    ] else [] end) + [
+      {network: "tcp,udp", outboundTag: "proxy"}
+    ])}
+  }' > "$tmp"
+  chown root:"$(nobody_group)" "$tmp"; chmod 640 "$tmp"
+  if XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >/dev/null 2>&1; then mv "$tmp" "$CONF"
+  else XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >&2 || true; rm -f "$tmp"; die "generated config failed 'xray -test' (shown above)"; fi
+}
+
+write_units() {
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=xray-channel client (VLESS + REALITY + Vision)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nobody
+Environment=XRAY_LOCATION_ASSET=$ASSETS
+ExecStart=$BIN run -config $CONF
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$NET_UNIT" <<EOF
+[Unit]
+Description=xray-channel client network rules (nftables, policy routing)
+After=network-online.target
+Wants=network-online.target
+Before=xray-channel.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SELF net-up
+ExecStop=$SELF net-down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# ---- network rules ----------------------------------------------------------------
+PRIVATE4="0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4"
+
+cmd_net_down() {
+  nft list table ip xray_channel >/dev/null 2>&1 && nft delete table ip xray_channel
+  while ip rule del fwmark "$MARK" lookup "$TABLE" 2>/dev/null; do :; done
+  ip route flush table "$TABLE" 2>/dev/null || true
+}
+cmd_net_up() {
+  load_state; cmd_net_down
+  local rules
+  rules="table ip xray_channel {
+  set private4 { type ipv4_addr; flags interval; elements = { $PRIVATE4 } }
+  chain input {
+    type filter hook input priority filter; policy accept;
+    tcp dport { $SOCKS_PORT, $HTTP_PORT, $TPROXY_PORT } ip saddr != @private4 drop
+  }"
+  if [ "$MODE" != proxy ]; then
+    rules+="
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname != \"$LAN_IF\" return
+    fib daddr type local return
+    meta l4proto { tcp, udp } th dport 53 meta mark set $MARK tproxy to :$TPROXY_PORT accept
+    ip daddr @private4 return
+    meta l4proto { tcp, udp } meta mark set $MARK tproxy to :$TPROXY_PORT accept
+  }"
+  fi
+  rules+="
+}"
+  if [ "$MODE" = router ]; then
+    rules+="
+table ip xray_channel_nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname \"$WAN_IF\" masquerade
+  }
+}"
+    nft list table ip xray_channel_nat >/dev/null 2>&1 && nft delete table ip xray_channel_nat
+  fi
+  printf '%s\n' "$rules" | nft -f - || die "nftables rules failed (is the nft_tproxy kernel module available?)"
+  if [ "$MODE" != proxy ]; then
+    ip rule add fwmark "$MARK" lookup "$TABLE"
+    ip route add local 0.0.0.0/0 dev lo table "$TABLE"
+  fi
+}
+
+setup_sysctl() {
+  cat > /etc/sysctl.d/90-xray-channel.conf <<EOF
+net.ipv4.ip_forward=1
+EOF
+  if [ "$MODE" = router ]; then
+    # LAN side gets IPv4 only, so nothing leaks around the tunnel over IPv6
+    echo "net.ipv6.conf.$LAN_IF.disable_ipv6=1" >> /etc/sysctl.d/90-xray-channel.conf
+  fi
+  sysctl -q --system >/dev/null 2>&1 || true
+}
+
+setup_lan_router() {   # static LAN address via NetworkManager
+  command -v nmcli >/dev/null || die "router mode needs NetworkManager (Raspberry Pi OS Bookworm has it). Set $LAN_IF to $LAN_CIDR yourself, then re-run with --skip-lan-setup"
+  nmcli -t -f NAME con show | grep -qx xc-lan && nmcli con delete xc-lan >/dev/null
+  nmcli con add type ethernet ifname "$LAN_IF" con-name xc-lan ipv4.method manual ipv4.addresses "$LAN_CIDR" \
+    ipv4.never-default yes ipv6.method disabled connection.autoconnect yes >/dev/null
+  nmcli con up xc-lan >/dev/null || c_warn "$LAN_IF is not up yet (cable plugged in?). It will come up automatically."
+}
+
+setup_dnsmasq() {
+  command -v dnsmasq >/dev/null || pkg_install dnsmasq
+  local ip="${LAN_CIDR%/*}" base
+  base="${ip%.*}"
+  mkdir -p /etc/dnsmasq.d
+  {
+    echo "# xray-channel: DNS for LAN devices goes through Xray (domestic direct, rest through the tunnel)"
+    echo "interface=$LAN_IF"
+    echo "bind-dynamic"
+    echo "no-resolv"
+    echo "server=127.0.0.1#$DNS_PORT"
+    echo "cache-size=2000"
+    if [ "$MODE" = router ]; then
+      echo "dhcp-range=$base.50,$base.200,12h"
+      echo "dhcp-option=option:router,$ip"
+      echo "dhcp-option=option:dns-server,$ip"
+    fi
+  } > "$DNSMASQ_CONF"
+  # Debian/Raspberry Pi OS already read /etc/dnsmasq.d (via /etc/default/dnsmasq); others may need it added
+  if ! grep -qs '^CONFIG_DIR=.*dnsmasq.d' /etc/default/dnsmasq && ! grep -qs '^conf-dir=/etc/dnsmasq.d' /etc/dnsmasq.conf; then
+    echo 'conf-dir=/etc/dnsmasq.d/,*.conf' >> /etc/dnsmasq.conf
+  fi
+  systemctl enable -q dnsmasq; systemctl restart dnsmasq || { journalctl -u dnsmasq -n 20 --no-pager; die "dnsmasq failed (is something else on port 53?)"; }
+}
+
+default_if() { ip -4 route show default 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -1; }
+if_ip() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | head -1; }
+
+# ---- commands ----------------------------------------------------------------
+cmd_install() {
+  need_root
+  LINK=""; MODE=proxy; LAN_IF=""; WAN_IF=""; LAN_CIDR="192.168.88.1/24"; DIRECT_CN=yes
+  local offline="" skip_lan=no
+  while [ $# -gt 0 ]; do case "$1" in
+    --link) LINK="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --lan) LAN_IF="$2"; shift 2 ;;
+    --wan) WAN_IF="$2"; shift 2 ;;
+    --lan-ip) LAN_CIDR="$2"; shift 2 ;;
+    --all-through-tunnel) DIRECT_CN=no; shift ;;
+    --offline) offline="$(cd "$2" && pwd)"; shift 2 ;;
+    --skip-lan-setup) skip_lan=yes; shift ;;
+    *) die "unknown option $1 (see: xray-channel-client help)" ;;
+  esac; done
+  [ -n "$LINK" ] || die "--link 'vless://...' is required (from: xray-channel-server client-cmd <name>)"
+  parse_link "$LINK"
+  case "$MODE" in proxy|gateway|router) ;; *) die "--mode must be proxy, gateway or router" ;; esac
+
+  if [ "$MODE" = gateway ]; then LAN_IF="${LAN_IF:-$(default_if)}"; fi
+  if [ "$MODE" = router ]; then
+    WAN_IF="${WAN_IF:-$(default_if)}"
+    [ -n "$LAN_IF" ] || die "router mode needs --lan <second network port>, e.g. --lan eth1 (see 'ip link')"
+    [ "$LAN_IF" != "$WAN_IF" ] || die "--lan and --wan must be different ports"
+    ip link show "$LAN_IF" >/dev/null 2>&1 || die "no network port called $LAN_IF"
+  fi
+  [ "$MODE" = proxy ] || [ -n "$LAN_IF" ] || die "could not find the network port: pass --lan"
+
+  # copy ourselves into place so the systemd unit can call net-up/net-down
+  if [ "$(readlink -f "$0")" != "$SELF" ]; then install -m 755 "$0" "$SELF"; fi
+
+  local tools=()
+  for t in curl unzip jq; do command -v "$t" >/dev/null || tools+=("$t"); done
+  command -v nft >/dev/null || tools+=(nftables)
+  [ ${#tools[@]} -eq 0 ] || pkg_install "${tools[@]}"
+  if [ "$MODE" != proxy ]; then
+    modprobe nft_tproxy 2>/dev/null || modprobe nf_tproxy_ipv4 2>/dev/null || c_warn "tproxy kernel module not loaded; gateway mode may not work on this kernel"
+  fi
+
+  install_xray "$offline"
+  save_state
+  write_units
+  render_config
+  setup_sysctl
+  if [ "$MODE" = router ] && [ "$skip_lan" = no ]; then setup_lan_router; fi
+  systemctl enable -q xray-channel-net xray-channel
+  systemctl restart xray-channel-net
+  systemctl restart xray-channel; sleep 2
+  systemctl is-active -q xray-channel || { journalctl -u xray-channel -n 30 --no-pager; die "xray-channel failed to start"; }
+  [ "$MODE" = proxy ] || setup_dnsmasq
+
+  echo; c_ok "Connected setup installed (mode: $MODE)."
+  cmd_test || true
+  echo
+  local me; me=$(if_ip "${LAN_IF:-$(default_if)}"); me="${me%/*}"
+  case "$MODE" in
+    proxy)
+      echo "On your devices, set a proxy:  SOCKS5 $me:$SOCKS_PORT   or   HTTP $me:$HTTP_PORT" ;;
+    gateway)
+      echo "On each device (or in your home router's DHCP settings), set:"
+      echo "  Gateway: $me    DNS: $me"
+      c_warn "Turn off IPv6 on the home router, or devices may skip the Pi over IPv6." ;;
+    router)
+      echo "Plug your devices / Wi-Fi access point into $LAN_IF. They get addresses from ${LAN_CIDR%/*} automatically." ;;
+  esac
+}
+
+cmd_test() {
+  local ip
+  printf 'Testing the tunnel... '
+  ip=$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://api.ipify.org 2>/dev/null) || {
+    c_warn "FAILED. Check: journalctl -u xray-channel -n 50"; return 1; }
+  c_ok "OK: traffic leaves from $ip"
+}
+cmd_status() {
+  load_state; parse_link "$LINK"
+  echo "xray-channel-client $VERSION | $("$BIN" version 2>/dev/null | head -1)"
+  echo "Profile: ${S_NAME:-default}  Server: $S_HOST:$S_PORT  camouflage: $S_SNI  mode: $MODE  domestic-direct: $DIRECT_CN"
+  systemctl --no-pager --lines=5 status xray-channel || true
+  cmd_test || true
+}
+cmd_set_link() {
+  need_root; load_state; LINK="${1:-}"; parse_link "$LINK"; save_state; render_config
+  systemctl restart xray-channel; sleep 2; cmd_test
+}
+cmd_update() { need_root; load_state; install_xray ""; render_config; systemctl restart xray-channel; c_ok "Updated."; }
+cmd_uninstall() {
+  need_root
+  systemctl disable -q --now xray-channel xray-channel-net 2>/dev/null || true
+  cmd_net_down
+  nft list table ip xray_channel_nat >/dev/null 2>&1 && nft delete table ip xray_channel_nat
+  rm -f "$UNIT" "$NET_UNIT" /etc/sysctl.d/90-xray-channel.conf
+  if [ -f "$DNSMASQ_CONF" ]; then rm -f "$DNSMASQ_CONF"; systemctl restart dnsmasq 2>/dev/null || true; fi
+  command -v nmcli >/dev/null && nmcli -t -f NAME con show | grep -qx xc-lan && nmcli con delete xc-lan >/dev/null
+  systemctl daemon-reload
+  rm -rf "$ETC" "$CONF_DIR" "$CACHE"
+  c_ok "Removed. (Xray binary left in $BIN.)"
+}
+
+usage() {
+  cat <<EOF
+xray-channel-client $VERSION
+
+  install --link 'vless://...' [--mode proxy|gateway|router] [options]
+      --mode proxy      SOCKS5 :$SOCKS_PORT + HTTP :$HTTP_PORT on the LAN (default)
+      --mode gateway    one port: devices use the Pi as gateway + DNS
+      --mode router     two ports: --lan <port> to devices, --wan <port> to the ISP router
+      --lan-ip CIDR     router mode LAN address (default 192.168.88.1/24)
+      --all-through-tunnel   send China sites through the tunnel too (default: direct)
+      --offline DIR     install Xray from a bundle made by 'xray-channel-server bundle'
+  status | test | set-link 'vless://...' | update | uninstall
+EOF
+}
+
+case "${1:-help}" in
+  install) shift; cmd_install "$@" ;;
+  status) cmd_status ;;
+  test) cmd_test ;;
+  set-link) cmd_set_link "${2:-}" ;;
+  update) cmd_update ;;
+  uninstall) cmd_uninstall ;;
+  net-up) cmd_net_up ;;
+  net-down) cmd_net_down ;;
+  version) echo "$VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
