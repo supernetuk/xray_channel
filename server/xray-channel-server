@@ -81,7 +81,12 @@ install_xray() {
   c_ok "Xray installed: $("$BIN" version | head -1)"
 }
 
-nobody_group() { id -gn nobody 2>/dev/null || echo nogroup; }
+SVC_USER=xray-channel
+ensure_svc_user() {   # dedicated unprivileged account for the Xray service
+  id -u "$SVC_USER" >/dev/null 2>&1 && return 0
+  useradd --system --no-create-home --home-dir /nonexistent \
+    --shell "$(command -v nologin || echo /bin/false)" "$SVC_USER" || die "could not create user $SVC_USER"
+}
 
 write_unit() {
   cat > "$UNIT" <<EOF
@@ -91,7 +96,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=nobody
+User=xray-channel
+Group=xray-channel
 Environment=XRAY_LOCATION_ASSET=$ASSETS
 ExecStart=$BIN run -config $CONF
 Restart=on-failure
@@ -147,9 +153,11 @@ detect_host() {
 load_state() { [ -f "$STATE" ] || die "not installed: run 'xray-channel-server install'"; # shellcheck disable=SC1090
   . "$STATE"; }
 save_state() {   # values are shell-escaped, so the file is safe to source
-  umask 077; mkdir -p "$ETC"; chmod 700 "$ETC"
+  mkdir -p "$ETC"; chmod 700 "$ETC"
   local v
-  for v in HOST PORT SNI PRIVATE_KEY PUBLIC_KEY SHORT_ID FINGERPRINT; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE"
+  ( umask 077
+    for v in HOST PORT SNI PRIVATE_KEY PUBLIC_KEY SHORT_ID FINGERPRINT; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE" )
+  chmod 600 "$STATE"
 }
 valid_host() { [[ "$1" =~ ^[A-Za-z0-9.-]{1,253}$ || "$1" =~ ^[0-9A-Fa-f:]{2,39}$ ]]; }
 valid_domain() { [[ "$1" =~ ^([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$ ]]; }
@@ -163,6 +171,7 @@ render_config() {
     jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {id: .[1], email: .[0], flow: "xtls-rprx-vision"})')
   mkdir -p "$CONF_DIR"
   tmp=$(mktemp --suffix=.json "$CONF_DIR/.config.XXXXXX")
+  chmod 755 "$CONF_DIR"
   jq -n --argjson port "$PORT" --argjson clients "$clients" \
      --arg sni "$SNI" --arg pk "$PRIVATE_KEY" --arg sid "$SHORT_ID" '
   {
@@ -186,7 +195,7 @@ render_config() {
       {protocol: ["bittorrent"], outboundTag: "block"}
     ]}
   }' > "$tmp"
-  chown root:"$(nobody_group)" "$tmp"; chmod 640 "$tmp"
+  chown root:"$SVC_USER" "$tmp"; chmod 640 "$tmp"
   if XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$CONF"
   else
@@ -264,6 +273,7 @@ cmd_install() {
   ensure_tools
   command -v qrencode >/dev/null || pkg_install qrencode 2>/dev/null || true
   install_xray
+  ensure_svc_user
   write_unit
 
   if [ -z "$SNI" ]; then
@@ -328,7 +338,7 @@ cmd_status() {
   systemctl --no-pager --lines=5 status xray-channel || true
 }
 cmd_update() {
-  need_root; load_state; ensure_tools; install_xray; apply; c_ok "Updated."
+  need_root; load_state; ensure_tools; install_xray; ensure_svc_user; write_unit; apply; c_ok "Updated."
 }
 cmd_bundle() {   # offline package for clients that can't reach GitHub
   need_root; load_state

@@ -81,7 +81,12 @@ install_xray() {   # $1 = offline dir or ""
   rm -rf "$tmp"
   c_ok "Xray installed: $("$BIN" version | head -1)"
 }
-nobody_group() { id -gn nobody 2>/dev/null || echo nogroup; }
+SVC_USER=xray-channel
+ensure_svc_user() {   # dedicated unprivileged account for the Xray service
+  id -u "$SVC_USER" >/dev/null 2>&1 && return 0
+  useradd --system --no-create-home --home-dir /nonexistent \
+    --shell "$(command -v nologin || echo /bin/false)" "$SVC_USER" || die "could not create user $SVC_USER"
+}
 
 # ---- link parsing -------------------------------------------------------------
 urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
@@ -119,9 +124,11 @@ parse_link() {   # sets S_UUID S_HOST S_PORT S_SNI S_FP S_PBK S_SID S_FLOW S_NAM
 load_state() { [ -f "$STATE" ] || die "not installed: run 'xray-channel-client install --link ...'"; # shellcheck disable=SC1090
   . "$STATE"; }
 save_state() {   # values are shell-escaped, so the file is safe to source as root
-  mkdir -p "$ETC"; chmod 700 "$ETC"; umask 077
+  mkdir -p "$ETC"; chmod 700 "$ETC"
   local v
-  for v in LINK MODE LAN_IF WAN_IF LAN_CIDR DIRECT_CN; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE"
+  ( umask 077
+    for v in LINK MODE LAN_IF WAN_IF LAN_CIDR DIRECT_CN; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE" )
+  chmod 600 "$STATE"
 }
 
 # ---- Xray config ----------------------------------------------------------------
@@ -130,6 +137,7 @@ render_config() {
   local tproxy=false; [ "$MODE" != proxy ] && tproxy=true
   local direct_cn=false; [ "$DIRECT_CN" = yes ] && direct_cn=true
   local tmp; mkdir -p "$CONF_DIR"; tmp=$(mktemp --suffix=.json "$CONF_DIR/.config.XXXXXX")
+  chmod 755 "$CONF_DIR"
   jq -n \
     --arg host "$S_HOST" --argjson port "$S_PORT" --arg uuid "$S_UUID" --arg flow "$S_FLOW" \
     --arg sni "$S_SNI" --arg fp "$S_FP" --arg pbk "$S_PBK" --arg sid "$S_SID" \
@@ -178,7 +186,7 @@ render_config() {
       {network: "tcp,udp", outboundTag: "proxy"}
     ])}
   }' > "$tmp"
-  chown root:"$(nobody_group)" "$tmp"; chmod 640 "$tmp"
+  chown root:"$SVC_USER" "$tmp"; chmod 640 "$tmp"
   if XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >/dev/null 2>&1; then mv "$tmp" "$CONF"
   else XRAY_LOCATION_ASSET=$ASSETS "$BIN" run -test -config "$tmp" >&2 || true; rm -f "$tmp"; die "generated config failed 'xray -test' (shown above)"; fi
 }
@@ -191,7 +199,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=nobody
+User=xray-channel
+Group=xray-channel
 Environment=XRAY_LOCATION_ASSET=$ASSETS
 ExecStart=$BIN run -config $CONF
 Restart=always
@@ -366,6 +375,7 @@ cmd_install() {
   fi
 
   install_xray "$offline"
+  ensure_svc_user
   save_state
   write_units
   render_config
@@ -411,7 +421,7 @@ cmd_set_link() {
   need_root; load_state; LINK="${1:-}"; parse_link "$LINK"; save_state; render_config
   systemctl restart xray-channel; sleep 2; cmd_test
 }
-cmd_update() { need_root; load_state; install_xray ""; render_config; systemctl restart xray-channel; c_ok "Updated."; }
+cmd_update() { need_root; load_state; install_xray ""; ensure_svc_user; write_units; render_config; systemctl restart xray-channel; c_ok "Updated."; }
 cmd_uninstall() {
   need_root
   systemctl disable -q --now xray-channel xray-channel-net 2>/dev/null || true
