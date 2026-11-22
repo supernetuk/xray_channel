@@ -178,7 +178,16 @@ render_config() {
      --arg sni "$SNI" --arg pk "$PRIVATE_KEY" --arg sid "$SHORT_ID" '
   {
     log: {loglevel: "warning"},
+    stats: {},
+    api: {tag: "api", services: ["StatsService"]},
+    policy: {
+      levels: {"0": {statsUserUplink: true, statsUserDownlink: true, statsUserOnline: true}},
+      system: {statsInboundUplink: true, statsInboundDownlink: true}
+    },
     inbounds: [{
+      tag: "api-in", listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door",
+      settings: {address: "127.0.0.1"}
+    }, {
       tag: "vless-in", port: $port, protocol: "vless",
       settings: {clients: $clients, decryption: "none"},
       streamSettings: {
@@ -193,6 +202,7 @@ render_config() {
       {tag: "block", protocol: "blackhole"}
     ],
     routing: {domainStrategy: "IPIfNonMatch", rules: [
+      {inboundTag: ["api-in"], outboundTag: "api"},
       {ip: ["geoip:private"], outboundTag: "block"},
       {protocol: ["bittorrent"], outboundTag: "block"}
     ]}
@@ -367,6 +377,49 @@ EOF
   c_ok "Bundle: $out"
   echo "Copy it to the Pi (USB, scp...), then:  tar xzf xray-channel-$name.tar.gz && sudo bash xray-channel-$name/install.sh"
 }
+
+# ---- usage / who is online (Xray stats API on 127.0.0.1:10085) ----------------
+API=127.0.0.1:10085
+human_bytes() { awk -v b="${1:-0}" 'BEGIN{split("B KB MB GB TB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++};printf (i==1?"%d %s":"%.1f %s"),b,u[i]}'; }
+cmd_online() {
+  load_state
+  local name ips n total=0 json probe
+  probe=$("$BIN" api statsonlineiplist --server="$API" -email "__probe__" 2>&1 || true)
+  if grep -qiE "unknown command|not found|no such|usage:" <<<"$probe" && ! grep -qi "online" <<<"$probe"; then
+    die "this Xray version can't list online users. Run 'update' to get the latest Xray, or use 'usage' instead."
+  fi
+  if grep -qiE "connection refused|dial tcp" <<<"$probe"; then
+    die "the stats service isn't answering. Run 'update' once to switch it on (this restarts Xray for a second)."
+  fi
+  printf '%-24s %-8s %s\n' USER ONLINE "IP ADDRESSES"
+  while IFS=$'\t' read -r name _; do
+    [ -n "$name" ] || continue
+    json=$("$BIN" api statsonlineiplist --server="$API" -email "$name" 2>/dev/null || true)
+    ips=$(jq -r '(.ips // {}) | keys | join(", ")' <<<"${json:-{\}}" 2>/dev/null || true)
+    n=$(jq -r '(.ips // {}) | length' <<<"${json:-{\}}" 2>/dev/null || echo 0)
+    [ -n "$n" ] || n=0
+    total=$((total + n))
+    printf '%-24s %-8s %s\n' "$name" "$([ "$n" -gt 0 ] && echo "yes ($n)" || echo no)" "${ips:--}"
+  done < "$USERS"
+  echo; echo "Devices connected now (by IP): $total"
+  echo "(A user shows as online while connected or for a short time after; one IP can be several devices behind one router.)"
+}
+cmd_usage() {
+  load_state
+  local reset="" json
+  [ "${1:-}" = --reset ] && reset="-reset"
+  json=$("$BIN" api statsquery --server="$API" -pattern "user>>>" $reset 2>/dev/null) || die "could not read stats from Xray (is the service running? run 'update' once to switch stats on)"
+  printf '%-24s %12s %12s %12s\n' USER UPLOAD DOWNLOAD TOTAL
+  local name up down
+  while IFS=$'\t' read -r name _; do
+    [ -n "$name" ] || continue
+    up=$(jq -r --arg n "user>>>$name>>>traffic>>>uplink" '[.stat[]? | select(.name==$n) | (.value // 0 | tonumber)] | add // 0' <<<"$json")
+    down=$(jq -r --arg n "user>>>$name>>>traffic>>>downlink" '[.stat[]? | select(.name==$n) | (.value // 0 | tonumber)] | add // 0' <<<"$json")
+    printf '%-24s %12s %12s %12s\n' "$name" "$(human_bytes "$up")" "$(human_bytes "$down")" "$(human_bytes $((up + down)))"
+  done < "$USERS"
+  echo; echo "Counted since the service last started$( [ -n "$reset" ] && echo '; counters now reset to zero')."
+}
+
 cmd_uninstall() {
   need_root
   read -r -p "Remove xray-channel server, its keys and all users? Type YES: " a; [ "$a" = YES ] || { echo Cancelled; exit 1; }
@@ -384,6 +437,8 @@ xray-channel-server $VERSION: Xray VLESS + REALITY + Vision server
   add <name>          add a user and print their one-line client command
   del <name>          remove a user (their link stops working)
   list                list users
+  online              who is connected now, and from which IPs
+  usage [--reset]     data used per user since the service started
   client-cmd <name>   print the client install command + app link (+ QR)
   link <name>         print only the vless:// link
   bundle <name>       make an offline package (for clients that can't reach GitHub)
@@ -406,6 +461,8 @@ case "${1:-help}" in
   set-host) cmd_set_host "${2:-}" ;;
   rotate-keys) cmd_rotate_keys ;;
   status) cmd_status ;;
+  online) cmd_online ;;
+  usage) cmd_usage "${2:-}" ;;
   update) cmd_update ;;
   uninstall) cmd_uninstall ;;
   version) echo "$VERSION" ;;

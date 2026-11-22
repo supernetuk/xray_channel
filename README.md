@@ -62,6 +62,8 @@ If `xray-channel-server` isn't found, your root PATH lacks `/usr/local/bin`: use
 | `xray-channel-server bundle alice` | Offline package (`/root/xray-channel-alice.tar.gz`) for a client that can't reach GitHub |
 | `xray-channel-server sni <domain>` | Change camouflage site (all clients need new links) |
 | `xray-channel-server rotate-keys` | New REALITY keys (all clients need new links) |
+| `xray-channel-server online` | Who is connected now, and from which IP addresses |
+| `xray-channel-server usage [--reset]` | Data used per user since the service started |
 | `xray-channel-server status` / `update` / `uninstall` | |
 
 The server blocks traffic from clients to private/LAN addresses (so users can't reach your internal network) and
